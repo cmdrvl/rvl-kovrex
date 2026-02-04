@@ -10,7 +10,7 @@
 //!
 //! ## Endpoints
 //! - `GET /health` - Health check (unauthenticated)
-//! - `POST /compare` - Compare two CSVs (requires bearer token if configured)
+//! - `POST /compare` - Compare two CSVs via JSON (requires bearer token if configured)
 
 use std::io::Write;
 use std::net::SocketAddr;
@@ -19,12 +19,13 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Multipart, State},
+    extract::{DefaultBodyLimit, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
 };
-use serde::Serialize;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -110,21 +111,48 @@ struct HealthResponse {
     version: &'static str,
 }
 
+/// JSON request body for comparison.
+#[derive(Deserialize)]
+struct CompareRequest {
+    /// Base64-encoded old CSV content
+    old: String,
+    /// Base64-encoded new CSV content
+    new: String,
+    /// Optional: Column name for row alignment
+    #[serde(default)]
+    key: Option<String>,
+    /// Optional: Coverage threshold (0-1, default 0.95)
+    #[serde(default = "default_threshold")]
+    threshold: f64,
+    /// Optional: Numeric tolerance (default 1e-9)
+    #[serde(default = "default_tolerance")]
+    tolerance: f64,
+    /// Optional: Force delimiter
+    #[serde(default)]
+    delimiter: Option<String>,
+}
+
+fn default_threshold() -> f64 { 0.95 }
+fn default_tolerance() -> f64 { 1e-9 }
+
 /// Compare two CSV files.
 ///
-/// Accepts multipart form data with:
-/// - `old`: The old CSV file
-/// - `new`: The new CSV file
-/// - `key`: (optional) Column name for row alignment
-/// - `threshold`: (optional) Coverage threshold (0-1, default 0.95)
-/// - `tolerance`: (optional) Numeric tolerance (default 1e-9)
-/// - `delimiter`: (optional) Force delimiter (comma/tab/semicolon/pipe/caret)
+/// Accepts JSON with base64-encoded CSV content:
+/// ```json
+/// {
+///   "old": "base64-encoded-csv",
+///   "new": "base64-encoded-csv",
+///   "key": "id",
+///   "threshold": 0.95,
+///   "tolerance": 1e-9
+/// }
+/// ```
 ///
 /// Requires `Authorization: Bearer <token>` header if `RVL_API_TOKEN` is set.
 async fn compare(
     State(config): State<Arc<Config>>,
     headers: HeaderMap,
-    mut multipart: Multipart,
+    Json(payload): Json<CompareRequest>,
 ) -> impl IntoResponse {
     // Check bearer token if configured
     if let Some(expected_token) = &config.api_token {
@@ -149,162 +177,90 @@ async fn compare(
         }
     }
 
-    let mut old_file: Option<NamedTempFile> = None;
-    let mut new_file: Option<NamedTempFile> = None;
-    let mut key: Option<String> = None;
-    let mut threshold: f64 = 0.95;
-    let mut tolerance: f64 = 1e-9;
-    let mut delimiter: Option<u8> = None;
-
-    // Parse multipart form
-    while let Ok(Some(field)) = multipart.next_field().await {
-        let name = field.name().unwrap_or("").to_string();
-        
-        match name.as_str() {
-            "old" => {
-                match field.bytes().await {
-                    Ok(data) => {
-                        let mut temp = match NamedTempFile::new() {
-                            Ok(t) => t,
-                            Err(e) => {
-                                return (
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    Json(ErrorResponse {
-                                        error: format!("Failed to create temp file: {}", e),
-                                    }),
-                                )
-                                    .into_response();
-                            }
-                        };
-                        if let Err(e) = temp.write_all(&data) {
-                            return (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                Json(ErrorResponse {
-                                    error: format!("Failed to write temp file: {}", e),
-                                }),
-                            )
-                                .into_response();
-                        }
-                        old_file = Some(temp);
-                    }
-                    Err(e) => {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            Json(ErrorResponse {
-                                error: format!("Failed to read 'old' file: {}", e),
-                            }),
-                        )
-                            .into_response();
-                    }
-                }
-            }
-            "new" => {
-                match field.bytes().await {
-                    Ok(data) => {
-                        let mut temp = match NamedTempFile::new() {
-                            Ok(t) => t,
-                            Err(e) => {
-                                return (
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    Json(ErrorResponse {
-                                        error: format!("Failed to create temp file: {}", e),
-                                    }),
-                                )
-                                    .into_response();
-                            }
-                        };
-                        if let Err(e) = temp.write_all(&data) {
-                            return (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                Json(ErrorResponse {
-                                    error: format!("Failed to write temp file: {}", e),
-                                }),
-                            )
-                                .into_response();
-                        }
-                        new_file = Some(temp);
-                    }
-                    Err(e) => {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            Json(ErrorResponse {
-                                error: format!("Failed to read 'new' file: {}", e),
-                            }),
-                        )
-                            .into_response();
-                    }
-                }
-            }
-            "key" => {
-                if let Ok(text) = field.text().await {
-                    if !text.is_empty() {
-                        key = Some(text);
-                    }
-                }
-            }
-            "threshold" => {
-                if let Ok(text) = field.text().await {
-                    if let Ok(val) = text.parse::<f64>() {
-                        if val > 0.0 && val <= 1.0 {
-                            threshold = val;
-                        }
-                    }
-                }
-            }
-            "tolerance" => {
-                if let Ok(text) = field.text().await {
-                    if let Ok(val) = text.parse::<f64>() {
-                        if val >= 0.0 {
-                            tolerance = val;
-                        }
-                    }
-                }
-            }
-            "delimiter" => {
-                if let Ok(text) = field.text().await {
-                    delimiter = parse_delimiter(&text);
-                }
-            }
-            _ => {
-                // Ignore unknown fields
-            }
+    // Decode base64 old CSV
+    let old_bytes = match BASE64.decode(&payload.old) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("Invalid base64 for 'old': {}", e),
+                }),
+            )
+                .into_response();
         }
+    };
+
+    // Decode base64 new CSV
+    let new_bytes = match BASE64.decode(&payload.new) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("Invalid base64 for 'new': {}", e),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    // Write old CSV to temp file
+    let mut old_temp = match NamedTempFile::new() {
+        Ok(t) => t,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to create temp file: {}", e),
+                }),
+            )
+                .into_response();
+        }
+    };
+    if let Err(e) = old_temp.write_all(&old_bytes) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to write temp file: {}", e),
+            }),
+        )
+            .into_response();
     }
 
-    // Validate required files
-    let old_temp = match old_file {
-        Some(f) => f,
-        None => {
+    // Write new CSV to temp file
+    let mut new_temp = match NamedTempFile::new() {
+        Ok(t) => t,
+        Err(e) => {
             return (
-                StatusCode::BAD_REQUEST,
+                StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
-                    error: "Missing required field: 'old' (CSV file)".to_string(),
+                    error: format!("Failed to create temp file: {}", e),
                 }),
             )
                 .into_response();
         }
     };
+    if let Err(e) = new_temp.write_all(&new_bytes) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Failed to write temp file: {}", e),
+            }),
+        )
+            .into_response();
+    }
 
-    let new_temp = match new_file {
-        Some(f) => f,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    error: "Missing required field: 'new' (CSV file)".to_string(),
-                }),
-            )
-                .into_response();
-        }
-    };
+    // Parse delimiter if provided
+    let delimiter = payload.delimiter.as_ref().and_then(|s| parse_delimiter(s));
 
     // Build args for orchestrator
     let args = Args::new(
         PathBuf::from(old_temp.path()),
         PathBuf::from(new_temp.path()),
-        key,
-        threshold,
-        tolerance,
+        payload.key,
+        payload.threshold,
+        payload.tolerance,
         delimiter,
         true, // Always return JSON from API
     );

@@ -35,12 +35,15 @@ cargo run --release
 # Health check
 curl http://localhost:8080/health
 
-# Compare two CSVs
+# Compare two CSVs (JSON with base64)
 curl -X POST http://localhost:8080/compare \
   -H "Authorization: Bearer $RVL_API_TOKEN" \
-  -F old=@old.csv \
-  -F new=@new.csv \
-  -F key=id
+  -H "Content-Type: application/json" \
+  -d '{
+    "old": "'$(base64 -i old.csv)'",
+    "new": "'$(base64 -i new.csv)'",
+    "key": "id"
+  }'
 ```
 
 ## API
@@ -62,13 +65,26 @@ Health check (unauthenticated).
 
 Compare two CSV files. Requires bearer token if `RVL_API_TOKEN` is set.
 
-**Request:** Multipart form data
-- `old` (required) - The old CSV file
-- `new` (required) - The new CSV file
-- `key` (optional) - Column name for row alignment
-- `threshold` (optional) - Coverage threshold, 0-1 (default: 0.95)
-- `tolerance` (optional) - Numeric tolerance (default: 1e-9)
-- `delimiter` (optional) - Force delimiter (comma/tab/semicolon/pipe/caret)
+**Request:** JSON
+```json
+{
+  "old": "base64-encoded-csv-content",
+  "new": "base64-encoded-csv-content",
+  "key": "id",
+  "threshold": 0.95,
+  "tolerance": 1e-9,
+  "delimiter": "comma"
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `old` | string | ✓ | Base64-encoded old CSV |
+| `new` | string | ✓ | Base64-encoded new CSV |
+| `key` | string | | Column for row alignment |
+| `threshold` | number | | Coverage target (default: 0.95) |
+| `tolerance` | number | | Noise floor (default: 1e-9) |
+| `delimiter` | string | | Force delimiter |
 
 **Response:** Same JSON structure as `rvl --json`
 
