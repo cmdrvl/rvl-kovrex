@@ -117,10 +117,18 @@ const KOVREX_FILE_API: &str = "https://gateway.kovrex.ai/v1/files";
 /// JSON request body for comparison.
 #[derive(Deserialize)]
 struct CompareRequest {
-    /// Base64-encoded old CSV content (or base64-encoded kvx_file_xxx reference)
-    old: String,
-    /// Base64-encoded new CSV content (or base64-encoded kvx_file_xxx reference)
-    new: String,
+    /// Base64-encoded old CSV content
+    #[serde(default)]
+    old: Option<String>,
+    /// Base64-encoded new CSV content
+    #[serde(default)]
+    new: Option<String>,
+    /// File ID from upload_file for old CSV (e.g., kvx_file_xxx)
+    #[serde(default)]
+    old_file_id: Option<String>,
+    /// File ID from upload_file for new CSV (e.g., kvx_file_xxx)
+    #[serde(default)]
+    new_file_id: Option<String>,
     /// Optional: Column name for row alignment
     #[serde(default)]
     key: Option<String>,
@@ -138,16 +146,77 @@ struct CompareRequest {
 fn default_threshold() -> f64 { 0.95 }
 fn default_tolerance() -> f64 { 1e-9 }
 
-/// Resolve a base64-encoded input to CSV bytes.
+/// Fetch file content from Kovrex file API by file_id.
+async fn fetch_file_by_id(
+    file_id: &str,
+    auth_header: Option<&str>,
+) -> Result<Vec<u8>, (StatusCode, String)> {
+    tracing::info!("Fetching file: {}", file_id);
+
+    let url = format!("{}/{}", KOVREX_FILE_API, file_id);
+    let client = reqwest::Client::new();
+    let mut request = client.get(&url);
+
+    if let Some(auth) = auth_header {
+        request = request.header("Authorization", auth);
+    }
+
+    let response = request.send().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("Failed to fetch file '{}': {}", file_id, e),
+        )
+    })?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("Kovrex file API returned {} for '{}': {}", status, file_id, body),
+        ));
+    }
+
+    let file_bytes = response.bytes().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("Failed to read file '{}': {}", file_id, e),
+        )
+    })?;
+
+    tracing::info!("Fetched {} bytes for {}", file_bytes.len(), file_id);
+    Ok(file_bytes.to_vec())
+}
+
+/// Resolve CSV input from either file_id or base64 content.
 /// 
-/// If the decoded content starts with "kvx_file_", fetch the actual file
-/// from Kovrex's file API. Otherwise, return the decoded bytes directly.
+/// Priority: file_id > content (base64)
+/// If content is base64-encoded kvx_file_xxx, also fetches from API.
 async fn resolve_csv_input(
-    encoded: &str,
+    file_id: Option<&str>,
+    content: Option<&str>,
     field_name: &str,
     auth_header: Option<&str>,
 ) -> Result<Vec<u8>, (StatusCode, String)> {
-    // Decode base64
+    // If file_id is provided, use it directly
+    if let Some(fid) = file_id {
+        if !fid.starts_with("kvx_file_") {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("Invalid file_id format for '{}': must start with kvx_file_", field_name),
+            ));
+        }
+        return fetch_file_by_id(fid, auth_header).await;
+    }
+
+    // Otherwise decode base64 content
+    let encoded = content.ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Either {}_file_id or {} must be provided", field_name, field_name),
+        )
+    })?;
+
     let bytes = BASE64.decode(encoded).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
@@ -155,58 +224,13 @@ async fn resolve_csv_input(
         )
     })?;
 
-    // Check if it's a file reference
+    // Check if decoded content is a file reference (backwards compat)
     let content_str = String::from_utf8_lossy(&bytes);
     if content_str.starts_with("kvx_file_") {
-        let file_id = content_str.trim();
-        tracing::info!("Resolving file reference: {}", file_id);
-
-        // Fetch from Kovrex file API
-        let url = format!("{}/{}", KOVREX_FILE_API, file_id);
-        let client = reqwest::Client::new();
-        let mut request = client.get(&url);
-
-        // Pass through authorization header
-        if let Some(auth) = auth_header {
-            request = request.header("Authorization", auth);
-        }
-
-        let response = request.send().await.map_err(|e| {
-            (
-                StatusCode::BAD_GATEWAY,
-                format!("Failed to fetch file '{}': {}", file_id, e),
-            )
-        })?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err((
-                StatusCode::BAD_GATEWAY,
-                format!(
-                    "Kovrex file API returned {} for '{}': {}",
-                    status, file_id, body
-                ),
-            ));
-        }
-
-        let file_bytes = response.bytes().await.map_err(|e| {
-            (
-                StatusCode::BAD_GATEWAY,
-                format!("Failed to read file '{}': {}", file_id, e),
-            )
-        })?;
-
-        tracing::info!(
-            "Fetched {} bytes for file reference {}",
-            file_bytes.len(),
-            file_id
-        );
-        Ok(file_bytes.to_vec())
-    } else {
-        // Direct CSV content
-        Ok(bytes)
+        return fetch_file_by_id(content_str.trim(), auth_header).await;
     }
+
+    Ok(bytes)
 }
 
 /// Compare two CSV files.
@@ -252,16 +276,26 @@ async fn compare(
         }
     }
 
-    // Resolve old CSV (handles both direct base64 and kvx_file_ references)
-    let old_bytes = match resolve_csv_input(&payload.old, "old", auth_header).await {
+    // Resolve old CSV (file_id takes priority over base64 content)
+    let old_bytes = match resolve_csv_input(
+        payload.old_file_id.as_deref(),
+        payload.old.as_deref(),
+        "old",
+        auth_header,
+    ).await {
         Ok(bytes) => bytes,
         Err((status, error)) => {
             return (status, Json(ErrorResponse { error })).into_response();
         }
     };
 
-    // Resolve new CSV (handles both direct base64 and kvx_file_ references)
-    let new_bytes = match resolve_csv_input(&payload.new, "new", auth_header).await {
+    // Resolve new CSV (file_id takes priority over base64 content)
+    let new_bytes = match resolve_csv_input(
+        payload.new_file_id.as_deref(),
+        payload.new.as_deref(),
+        "new",
+        auth_header,
+    ).await {
         Ok(bytes) => bytes,
         Err((status, error)) => {
             return (status, Json(ErrorResponse { error })).into_response();
