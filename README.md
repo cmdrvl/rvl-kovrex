@@ -1,10 +1,18 @@
 # rvl-kovrex
 
+Status: archived historical wrapper.
+
+The active hosted runtime for `rvl` now lives in [`cmdrvl/hosted-operators`](https://github.com/cmdrvl/hosted-operators), and the live public origin is `https://rvl.cmdrvl.com`.
+
+Do not start new deployment or integration work from this repo.
+
 **CMD+RVL's Kovrex agent wrapper for [rvl](https://github.com/cmdrvl/rvl).**
 
 This is a reference implementation showing how to wrap a CLI tool as a Kovrex agent with a REST API.
 
 ## What is this?
+
+This repo remains as historical reference only.
 
 [rvl](https://github.com/cmdrvl/rvl) is an open-source CLI that compares CSV files and reveals the smallest set of numeric changes that explain what actually changed.
 
